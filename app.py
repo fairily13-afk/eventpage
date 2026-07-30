@@ -3,6 +3,10 @@ import io
 import json
 import os
 import re
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
 import markdown
 import streamlit as st
@@ -23,6 +27,57 @@ load_dotenv()
 
 PDF_FONT = "HYGothic-Medium"
 registerFont(UnicodeCIDFont(PDF_FONT))
+
+DB_PATH = Path(__file__).parent / "shared_results.db"
+
+
+def _get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shared_results (
+            id TEXT PRIMARY KEY,
+            destination TEXT,
+            companion TEXT,
+            result_text TEXT NOT NULL,
+            image_png BLOB,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def save_shared_result(destination, companion, result_text, image_bytes):
+    share_id = uuid.uuid4().hex[:10]
+    conn = _get_db_connection()
+    with conn:
+        conn.execute(
+            "INSERT INTO shared_results (id, destination, companion, result_text, image_png, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (share_id, destination, companion, result_text, image_bytes, datetime.now(timezone.utc).isoformat()),
+        )
+    conn.close()
+    return share_id
+
+
+def load_shared_result(share_id):
+    conn = _get_db_connection()
+    row = conn.execute(
+        "SELECT destination, companion, result_text, image_png FROM shared_results WHERE id = ?",
+        (share_id,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    destination, companion, result_text, image_png = row
+    return {
+        "destination": destination,
+        "companion": companion,
+        "result_text": result_text,
+        "image_bytes": image_png,
+    }
+
 
 st.set_page_config(page_title="AI 맞춤 여행 코스 제작", page_icon="🧳", layout="centered")
 
@@ -71,38 +126,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-st.title("🧳 AI 맞춤 여행 코스 제작")
-st.caption("몇 가지만 선택하면 나만의 여행 코스를 만들어드려요")
-
-st.divider()
-
-destination = st.text_input("여행지", placeholder="예: 제주도, 오사카, 파리")
-
-date_range = st.date_input("일정", value=[])
-
-companion = st.radio(
-    "동행자",
-    ["혼자", "커플", "친구", "가족"],
-    horizontal=True,
-)
-
-budget = st.selectbox(
-    "예산",
-    ["10만원 이하", "10~30만원", "30~50만원", "50만원 이상"],
-)
-
-travel_style = st.multiselect(
-    "여행 스타일",
-    ["힐링", "액티비티", "맛집 탐방", "감성 사진", "쇼핑", "문화·역사"],
-)
-
-transportation = st.multiselect(
-    "이동수단",
-    ["도보", "대중교통", "렌터카", "택시"],
-)
-
-st.divider()
 
 TONE_KEYWORDS = ["감성적", "친근한", "청량한", "설레는", "직관적인", "개인 맞춤형"]
 
@@ -225,10 +248,11 @@ def build_pdf(result_text, image_bytes, destination, companion, hashtags):
     return buffer.getvalue()
 
 
-def render_share_button(subtitle, hashtags, image_bytes):
+def render_share_button(subtitle, hashtags, image_bytes, share_url):
     share_text = f"{subtitle}\n\n{hashtags}"
     share_text_js = json.dumps(share_text)
     image_b64_js = json.dumps(base64.b64encode(image_bytes).decode()) if image_bytes else "null"
+    share_url_js = json.dumps(share_url) if share_url else "null"
 
     html = f"""
     <div style="width:100%; font-family: 'Source Sans Pro', sans-serif;">
@@ -242,6 +266,7 @@ def render_share_button(subtitle, hashtags, image_bytes):
     <script>
       const shareText = {share_text_js};
       const imageB64 = {image_b64_js};
+      const shareUrl = {share_url_js};
       const btn = document.getElementById('share-btn');
       const msg = document.getElementById('share-msg');
 
@@ -257,6 +282,10 @@ def render_share_button(subtitle, hashtags, image_bytes):
       btn.addEventListener('click', async () => {{
         msg.textContent = '';
         const shareData = {{ title: 'AI 맞춤 여행 코스', text: shareText }};
+        if (shareUrl) {{
+          shareData.url = shareUrl;
+        }}
+        const fallbackText = shareUrl ? (shareText + '\\n' + shareUrl) : shareText;
         try {{
           if (imageB64 && navigator.canShare) {{
             const file = new File([b64ToBlob(imageB64)], 'travel-course.png', {{ type: 'image/png' }});
@@ -275,7 +304,7 @@ def render_share_button(subtitle, hashtags, image_bytes):
             // 사용자가 공유를 취소함
           }} else {{
             try {{
-              await navigator.clipboard.writeText(shareText);
+              await navigator.clipboard.writeText(fallbackText);
               msg.textContent = '이 브라우저는 공유를 지원하지 않아 텍스트를 클립보드에 복사했어요.';
             }} catch (clipErr) {{
               msg.textContent = '공유에 실패했어요. 다시 시도해주세요.';
@@ -288,7 +317,7 @@ def render_share_button(subtitle, hashtags, image_bytes):
     components.html(html, height=70)
 
 
-def render_result_card(result_text, image_bytes):
+def render_result_card(result_text, image_bytes, destination, companion, share_id):
     if image_bytes:
         image_b64 = base64.b64encode(image_bytes).decode()
         image_html = f'<img src="data:image/png;base64,{image_b64}" style="width:100%; border-radius:14px; margin-bottom:16px;" />'
@@ -335,6 +364,9 @@ def render_result_card(result_text, image_bytes):
     )
 
     pdf_bytes = build_pdf(result_text, image_bytes, destination, companion, hashtags)
+    base_url = st.context.url or ""
+    share_url = f"{base_url}?share_id={share_id}" if base_url and share_id else None
+
     save_col, share_col = st.columns(2)
     with save_col:
         st.download_button(
@@ -345,20 +377,80 @@ def render_result_card(result_text, image_bytes):
             use_container_width=True,
         )
     with share_col:
-        render_share_button(subtitle, hashtags, image_bytes)
+        render_share_button(subtitle, hashtags, image_bytes, share_url)
 
+    if share_url:
+        st.caption("🔗 아래 링크를 복사해서 친구에게 공유해보세요")
+        st.code(share_url, language=None)
+
+
+st.title("🧳 AI 맞춤 여행 코스 제작")
+st.caption("몇 가지만 선택하면 나만의 여행 코스를 만들어드려요")
+
+st.divider()
+
+shared_id_param = st.query_params.get("share_id")
+if shared_id_param:
+    shared = load_shared_result(shared_id_param)
+    base_url = st.context.url or ""
+    if shared:
+        st.info("📎 친구가 공유한 여행 코스예요")
+        render_result_card(
+            shared["result_text"],
+            shared["image_bytes"],
+            shared["destination"],
+            shared["companion"],
+            shared_id_param,
+        )
+        if base_url:
+            st.link_button("✨ 나도 만들기", url=base_url, use_container_width=True)
+    else:
+        st.warning("공유 링크를 찾을 수 없거나 삭제됐어요.")
+        if base_url:
+            st.link_button("🏠 홈으로", url=base_url, use_container_width=True)
+    st.stop()
+
+destination = st.text_input("여행지", placeholder="예: 제주도, 오사카, 파리")
+
+date_range = st.date_input("일정", value=[])
+
+companion = st.radio(
+    "동행자",
+    ["혼자", "커플", "친구", "가족"],
+    horizontal=True,
+)
+
+budget = st.selectbox(
+    "예산",
+    ["10만원 이하", "10~30만원", "30~50만원", "50만원 이상"],
+)
+
+travel_style = st.multiselect(
+    "여행 스타일",
+    ["힐링", "액티비티", "맛집 탐방", "감성 사진", "쇼핑", "문화·역사"],
+)
+
+transportation = st.multiselect(
+    "이동수단",
+    ["도보", "대중교통", "렌터카", "택시"],
+)
+
+st.divider()
 
 if "generating" not in st.session_state:
     st.session_state.generating = False
+if "result" not in st.session_state:
+    st.session_state.result = None
 
 
 def _trigger_generate():
     st.session_state.generating = True
+    st.session_state.result = None
 
 
 st.button("결과 보기", use_container_width=True, on_click=_trigger_generate)
 
-if st.session_state.generating:
+if st.session_state.generating and st.session_state.result is None:
     prompt = build_prompt()
 
     with st.spinner("여행 코스를 만들고 있어요..."):
@@ -372,6 +464,17 @@ if st.session_state.generating:
         except Exception:
             image_bytes = None
 
-    render_result_card(result_text, image_bytes)
+    share_id = save_shared_result(destination, companion, result_text, image_bytes)
+    st.session_state.result = {
+        "text": result_text,
+        "image": image_bytes,
+        "destination": destination,
+        "companion": companion,
+        "share_id": share_id,
+    }
+
+if st.session_state.result:
+    r = st.session_state.result
+    render_result_card(r["text"], r["image"], r["destination"], r["companion"], r["share_id"])
 
     st.button("다시 생성", use_container_width=True, on_click=_trigger_generate)
