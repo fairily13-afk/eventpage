@@ -1,12 +1,28 @@
 import base64
+import io
+import json
 import os
+import re
 
 import markdown
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from openai import OpenAI
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.pdfmetrics import registerFont
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 load_dotenv()
+
+PDF_FONT = "HYGothic-Medium"
+registerFont(UnicodeCIDFont(PDF_FONT))
 
 st.set_page_config(page_title="AI 맞춤 여행 코스 제작", page_icon="🧳", layout="centered")
 
@@ -139,6 +155,139 @@ def generate_image(prompt):
     return base64.b64decode(response.data[0].b64_json)
 
 
+def _inline_markdown_to_pdf_markup(text):
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
+    return text
+
+
+def build_pdf(result_text, image_bytes, destination, companion, hashtags):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=20 * mm,
+        bottomMargin=20 * mm,
+        leftMargin=18 * mm,
+        rightMargin=18 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "KTitle", parent=styles["Title"], fontName=PDF_FONT, fontSize=20,
+        textColor=colors.HexColor(ACCENT), alignment=TA_CENTER,
+    )
+    subtitle_style = ParagraphStyle(
+        "KSubtitle", parent=styles["Normal"], fontName=PDF_FONT, fontSize=11,
+        textColor=colors.HexColor("#888888"), alignment=TA_CENTER, spaceAfter=14,
+    )
+    heading_style = ParagraphStyle(
+        "KHeading", parent=styles["Heading2"], fontName=PDF_FONT, fontSize=14,
+        textColor=colors.HexColor(ACCENT), spaceBefore=12, spaceAfter=6,
+    )
+    body_style = ParagraphStyle(
+        "KBody", parent=styles["Normal"], fontName=PDF_FONT, fontSize=10.5,
+        leading=16, spaceAfter=6,
+    )
+    bullet_style = ParagraphStyle("KBullet", parent=body_style, leftIndent=12)
+    hashtag_style = ParagraphStyle(
+        "KHashtag", parent=styles["Normal"], fontName=PDF_FONT, fontSize=9.5,
+        textColor=colors.HexColor(ACCENT), spaceBefore=14,
+    )
+
+    place = destination or "그곳"
+    story = [
+        Paragraph("AI 맞춤 여행 코스", title_style),
+        Paragraph(f"{place}(으)로 떠나는 {companion} 여행, 설레는 나만의 이야기", subtitle_style),
+    ]
+
+    if image_bytes:
+        story.append(RLImage(io.BytesIO(image_bytes), width=150 * mm, height=150 * mm))
+        story.append(Spacer(1, 10 * mm))
+
+    for raw_line in result_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            story.append(Spacer(1, 4 * mm))
+        elif line.startswith("#"):
+            story.append(Paragraph(_inline_markdown_to_pdf_markup(line.lstrip("#").strip()), heading_style))
+        elif line.startswith(("-", "*", "•")):
+            item_text = line.lstrip("-*• ").strip()
+            story.append(Paragraph(f"• {_inline_markdown_to_pdf_markup(item_text)}", bullet_style))
+        else:
+            story.append(Paragraph(_inline_markdown_to_pdf_markup(line), body_style))
+
+    if hashtags:
+        story.append(Paragraph(_inline_markdown_to_pdf_markup(hashtags), hashtag_style))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def render_share_button(subtitle, hashtags, image_bytes):
+    share_text = f"{subtitle}\n\n{hashtags}"
+    share_text_js = json.dumps(share_text)
+    image_b64_js = json.dumps(base64.b64encode(image_bytes).decode()) if image_bytes else "null"
+
+    html = f"""
+    <div style="width:100%; font-family: 'Source Sans Pro', sans-serif;">
+      <button id="share-btn" style="
+          width:100%; padding:10px; border-radius:10px; border:1px solid {ACCENT_SOFT};
+          background:white; color:{ACCENT}; font-weight:600;
+          font-size:14px; cursor:pointer;
+      ">📤 공유</button>
+      <div id="share-msg" style="margin-top:6px; font-size:12px; color:#888; text-align:center;"></div>
+    </div>
+    <script>
+      const shareText = {share_text_js};
+      const imageB64 = {image_b64_js};
+      const btn = document.getElementById('share-btn');
+      const msg = document.getElementById('share-msg');
+
+      function b64ToBlob(b64) {{
+        const byteChars = atob(b64);
+        const byteNumbers = new Array(byteChars.length);
+        for (let i = 0; i < byteChars.length; i++) {{
+          byteNumbers[i] = byteChars.charCodeAt(i);
+        }}
+        return new Blob([new Uint8Array(byteNumbers)], {{ type: 'image/png' }});
+      }}
+
+      btn.addEventListener('click', async () => {{
+        msg.textContent = '';
+        const shareData = {{ title: 'AI 맞춤 여행 코스', text: shareText }};
+        try {{
+          if (imageB64 && navigator.canShare) {{
+            const file = new File([b64ToBlob(imageB64)], 'travel-course.png', {{ type: 'image/png' }});
+            if (navigator.canShare({{ files: [file] }})) {{
+              shareData.files = [file];
+            }}
+          }}
+          if (navigator.share) {{
+            await navigator.share(shareData);
+            msg.textContent = '공유되었습니다.';
+          }} else {{
+            throw new Error('no-share-api');
+          }}
+        }} catch (err) {{
+          if (err && err.name === 'AbortError') {{
+            // 사용자가 공유를 취소함
+          }} else {{
+            try {{
+              await navigator.clipboard.writeText(shareText);
+              msg.textContent = '이 브라우저는 공유를 지원하지 않아 텍스트를 클립보드에 복사했어요.';
+            }} catch (clipErr) {{
+              msg.textContent = '공유에 실패했어요. 다시 시도해주세요.';
+            }}
+          }}
+        }}
+      }});
+    </script>
+    """
+    components.html(html, height=70)
+
+
 def render_result_card(result_text, image_bytes):
     if image_bytes:
         image_b64 = base64.b64encode(image_bytes).decode()
@@ -180,14 +329,23 @@ def render_result_card(result_text, image_bytes):
             <div style="margin-top:18px; padding-top:14px; border-top:1px dashed rgba(0,0,0,0.12); font-size:13px; color:{ACCENT};">
                 🗺️ {hashtags}
             </div>
-            <div style="margin-top:16px; display:flex; gap:10px;">
-                <button style="flex:1; padding:10px; border-radius:10px; border:none; background:{ACCENT}; color:white; font-weight:600;">💾 저장</button>
-                <button style="flex:1; padding:10px; border-radius:10px; border:1px solid {ACCENT_SOFT}; background:white; color:{ACCENT};">📤 공유</button>
-            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+    pdf_bytes = build_pdf(result_text, image_bytes, destination, companion, hashtags)
+    save_col, share_col = st.columns(2)
+    with save_col:
+        st.download_button(
+            "💾 저장 (PDF)",
+            data=pdf_bytes,
+            file_name=f"{destination or '여행코스'}_AI맞춤여행코스.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    with share_col:
+        render_share_button(subtitle, hashtags, image_bytes)
 
 
 if "generating" not in st.session_state:
